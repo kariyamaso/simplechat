@@ -1,34 +1,14 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import re
+import requests
 
-
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
-
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# ローカル推論サーバーのエンドポイント
+LOCAL_INFERENCE_ENDPOINT = os.environ.get("LOCAL_INFERENCE_ENDPOINT", "http://localhost:8000/invoke")
 
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
         print("Received event:", json.dumps(event))
         
         # Cognitoで認証されたユーザー情報を取得
@@ -43,7 +23,6 @@ def lambda_handler(event, context):
         conversation_history = body.get('conversationHistory', [])
         
         print("Processing message:", message)
-        print("Using model:", MODEL_ID)
         
         # 会話履歴を使用
         messages = conversation_history.copy()
@@ -54,51 +33,32 @@ def lambda_handler(event, context):
             "content": message
         })
         
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
+        # ローカル推論サーバーへのリクエストペイロード (シンプルな形式を想定)
         request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
+            "messages": messages
+            # 必要に応じてmaxTokensなどを追加
         }
         
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
+        print(f"Calling local inference server at {LOCAL_INFERENCE_ENDPOINT} with payload:", json.dumps(request_payload))
         
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+        # ローカル推論サーバーを呼び出し
+        response = requests.post(
+            LOCAL_INFERENCE_ENDPOINT,
+            headers={"Content-Type": "application/json"},
+            json=request_payload
         )
+        response.raise_for_status() # HTTPエラーがあれば例外を発生させる
         
         # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
+        response_body = response.json()
+        print("Local server response:", json.dumps(response_body, default=str))
         
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
+        # 応答の検証 (ローカルサーバーのレスポンス形式に合わせて調整が必要)
+        if not response_body.get('response'): # Assuming the local server returns {"response": "..."}
+             raise Exception("No 'response' key found in the local server response")
         
         # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
+        assistant_response = response_body['response'] # Assuming the local server returns {"response": "..."}
         
         # アシスタントの応答を会話履歴に追加
         messages.append({
@@ -111,7 +71,7 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "headers": {
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": "*", # ローカル開発用に "*" を維持。本番環境では適切なオリジンを指定
                 "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
                 "Access-Control-Allow-Methods": "OPTIONS,POST"
             },
@@ -122,19 +82,23 @@ def lambda_handler(event, context):
             })
         }
         
+    except requests.exceptions.RequestException as error: # Catch requests exceptions
+        print(f"Local Inference Server Request Error: {str(error)}")
+        error_message = f"Failed to connect to local inference server: {str(error)}"
     except Exception as error:
         print("Error:", str(error))
+        error_message = str(error) # General error message
         
-        return {
-            "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
-            "body": json.dumps({
-                "success": False,
-                "error": str(error)
-            })
-        }
+    return {
+        "statusCode": 500,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+            "Access-Control-Allow-Methods": "OPTIONS,POST"
+        },
+        "body": json.dumps({
+            "success": False,
+            "error": error_message # Use the specific error message
+        })
+    }
